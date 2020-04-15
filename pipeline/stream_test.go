@@ -370,3 +370,78 @@ func TestReconnectStreamDelay(t *testing.T) {
 		t.Fatalf("invalid delay: %v", delay)
 	}
 }
+
+func TestReconnectStreamCancel(t *testing.T) {
+
+	// testCtx is needed only because we can't be sure that the stream will be
+	// recreated by the reconnectStream before we have a chance to shut it
+	// down. testCtx prevents this test from leaking (at most) a goroutine.
+
+	testCtx, testCancel := context.WithCancel(context.Background())
+	defer testCancel()
+
+	var (
+		errs          = make(chan error)
+		cancellations = make(chan struct{})
+	)
+
+	stream := func(ctx context.Context) (<-chan EnvelopeOrError, error) {
+		out := make(chan EnvelopeOrError)
+
+		go func() {
+			var err error
+
+			// Get the error or return early if the test is over. Note that we
+			// only need to check testCtx once, at this point. If the read from
+			// errs goes through, the test will make sure that the rest of the
+			// operations will not block.
+
+			select {
+			case err = <-errs:
+				// Error received, go ahead.
+			case <-testCtx.Done():
+				close(out)
+				return
+			}
+
+			// Send the error down the stream and close the channel. This will
+			// force the reconnectStream to instantiate a new connection.
+
+			out <- EnvelopeOrError{Err: err}
+			close(out)
+
+			// Since this stream terminated and a new one is being created, this
+			// stream should receive a cancellation signal through the channel.
+
+			<-ctx.Done()
+
+			// Communicate to the test that this stream has been cancelled. The
+			// test is going to be waiting for it, so this write will not block
+			// indefinitely.
+
+			cancellations <- struct{}{}
+		}()
+
+		return out, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out := reconnectStream(ctx, stream, 0)
+
+	func() {
+		errs <- fmt.Errorf("nope")
+
+		if msg, ok := <-out; !ok {
+			t.Fatalf("channel should be open")
+		} else if msg.Err.Error() != "nope" {
+			t.Fatalf("invalid error: %v", msg.Err)
+		}
+
+		// If the reconnectStream doesn't cancel the current stream, the
+		// following read will block indefinitely.
+
+		<-cancellations
+	}()
+}

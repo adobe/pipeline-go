@@ -153,40 +153,48 @@ func reconnectStream(ctx context.Context, stream streamGetter, delay time.Durati
 	go func() {
 		defer close(out)
 
-	loop:
 		for {
-			in, err := stream(ctx)
+			stop := func() bool {
+				streamCtx, streamCancel := context.WithCancel(ctx)
+				defer streamCancel()
 
-			if err != nil {
-				select {
-				case out <- EnvelopeOrError{Err: fmt.Errorf("get stream: %v", err)}:
-					// Message sent
-				case <-ctx.Done():
-					return
-				}
-				select {
-				case <-time.After(delay):
-					continue
-				case <-ctx.Done():
-					return
-				}
-			}
+				in, err := stream(streamCtx)
 
-			for {
-				select {
-				case msg, ok := <-in:
-					if !ok {
-						continue loop
-					}
+				if err != nil {
 					select {
-					case out <- msg:
+					case out <- EnvelopeOrError{Err: fmt.Errorf("get stream: %v", err)}:
 						// Message sent
 					case <-ctx.Done():
-						return
+						return true
 					}
-				case <-ctx.Done():
-					return
+					select {
+					case <-time.After(delay):
+						return false
+					case <-ctx.Done():
+						return true
+					}
 				}
+
+				for {
+					select {
+					case msg, ok := <-in:
+						if !ok {
+							return false
+						}
+						select {
+						case out <- msg:
+							// Message sent
+						case <-ctx.Done():
+							return true
+						}
+					case <-ctx.Done():
+						return true
+					}
+				}
+			}()
+
+			if stop {
+				return
 			}
 		}
 	}()
