@@ -163,12 +163,6 @@ func reconnectStream(ctx context.Context, stream streamGetter, delay time.Durati
 				if err != nil {
 					select {
 					case out <- EnvelopeOrError{Err: fmt.Errorf("get stream: %v", err)}:
-						// Message sent
-					case <-ctx.Done():
-						return true
-					}
-					select {
-					case <-time.After(delay):
 						return false
 					case <-ctx.Done():
 						return true
@@ -176,17 +170,25 @@ func reconnectStream(ctx context.Context, stream streamGetter, delay time.Durati
 				}
 
 				for {
+					var (
+						msg EnvelopeOrError
+						ok  bool
+					)
+
 					select {
-					case msg, ok := <-in:
-						if !ok {
-							return false
-						}
-						select {
-						case out <- msg:
-							// Message sent
-						case <-ctx.Done():
-							return true
-						}
+					case msg, ok = <-in:
+						// Message received
+					case <-ctx.Done():
+						return true
+					}
+
+					if !ok {
+						return false
+					}
+
+					select {
+					case out <- msg:
+						// Message sent
 					case <-ctx.Done():
 						return true
 					}
@@ -194,6 +196,13 @@ func reconnectStream(ctx context.Context, stream streamGetter, delay time.Durati
 			}()
 
 			if stop {
+				return
+			}
+
+			select {
+			case <-time.After(delay):
+				continue
+			case <-ctx.Done():
 				return
 			}
 		}
