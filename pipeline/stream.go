@@ -21,34 +21,70 @@ import (
 	"time"
 )
 
-func envelopeStream(ctx context.Context, body io.ReadCloser) <-chan EnvelopeOrError {
+func envelopeStream(parent context.Context, body io.ReadCloser, pingTimeout time.Duration) <-chan EnvelopeOrError {
 	out := make(chan EnvelopeOrError)
 
 	go func() {
-		defer close(out)
 		defer body.Close()
+		defer close(out)
 
-		decoder := json.NewDecoder(body)
+		var (
+			envelope      EnvelopeOrError
+			envelopeCh    = make(chan EnvelopeOrError)
+			envelopeReady = false
+		)
+
+		var (
+			deadline   time.Time
+			deadlineCh = time.After(pingTimeout)
+		)
+
+		ctx, cancel := context.WithCancel(parent)
+		defer cancel()
+
+		go decodeEnvelopes(ctx, body, envelopeCh)
 
 		for {
-			e := new(Envelope)
+			var (
+				inCh  chan EnvelopeOrError
+				outCh chan EnvelopeOrError
+			)
 
-			if err := decoder.Decode(e); err != nil {
-				if err == io.EOF {
-					return
-				}
-
-				select {
-				case out <- EnvelopeOrError{Err: fmt.Errorf("decode envelope: %v", err)}:
-					return
-				case <-ctx.Done():
-					return
-				}
+			if envelopeReady {
+				outCh = out
+			} else {
+				inCh = envelopeCh
 			}
 
 			select {
-			case out <- EnvelopeOrError{Envelope: e}:
-				continue
+			case outCh <- envelope:
+				envelopeReady = false
+
+				if envelope.Err != nil {
+					return
+				}
+
+				if envelope.Envelope.Type == "END_OF_STREAM" {
+					return
+				}
+			case envelope = <-inCh:
+				envelopeReady = true
+
+				if envelope.Err == io.EOF {
+					return
+				}
+
+				if envelope.Envelope != nil && envelope.Envelope.Type == "PING" {
+					deadline = time.Now().Add(pingTimeout)
+				}
+			case <-deadlineCh:
+				now := time.Now()
+
+				if deadline.Before(now) {
+					return
+				}
+
+				deadlineCh = time.After(deadline.Sub(now))
 			case <-ctx.Done():
 				return
 			}
@@ -58,91 +94,29 @@ func envelopeStream(ctx context.Context, body io.ReadCloser) <-chan EnvelopeOrEr
 	return out
 }
 
-func pingFilter(ctx context.Context, in <-chan EnvelopeOrError, timeout time.Duration) <-chan EnvelopeOrError {
-	out := make(chan EnvelopeOrError)
+func decodeEnvelopes(ctx context.Context, r io.Reader, out chan<- EnvelopeOrError) {
+	decoder := json.NewDecoder(r)
 
-	go func() {
-		defer close(out)
+	for {
+		envelope, err := decodeEnvelope(decoder)
 
-		timer := time.NewTimer(timeout)
-
-		defer func() {
-			if timer.Stop() {
-				return
-			}
-
-			select {
-			case <-timer.C:
-				// The timer expired but we didn't drain the channel. Now the
-				// channel is empty and the timer will be correctly cleaned up.
-			default:
-				// The timer expired, but the channel was already drained, or
-				// the timer has been already closed. We dont't have to do
-				// anything else.
-			}
-		}()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-timer.C:
-				return
-			case msg, ok := <-in:
-				if !ok {
-					return
-				}
-
-				if msg.Envelope != nil && msg.Envelope.Type == "PING" {
-					if !timer.Stop() {
-						return
-					}
-					timer.Reset(timeout)
-				}
-
-				select {
-				case out <- msg:
-					continue
-				case <-ctx.Done():
-					return
-				}
-			}
+		select {
+		case out <- EnvelopeOrError{Envelope: envelope, Err: err}:
+			continue
+		case <-ctx.Done():
+			return
 		}
-	}()
-
-	return out
+	}
 }
 
-func endOfStreamFilter(ctx context.Context, in <-chan EnvelopeOrError) <-chan EnvelopeOrError {
-	out := make(chan EnvelopeOrError)
+func decodeEnvelope(decoder *json.Decoder) (*Envelope, error) {
+	var envelope Envelope
 
-	go func() {
-		defer close(out)
+	if err := decoder.Decode(&envelope); err != nil {
+		return nil, err
+	}
 
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case msg, ok := <-in:
-				if !ok {
-					return
-				}
-
-				select {
-				case out <- msg:
-					// Message sent.
-				case <-ctx.Done():
-					return
-				}
-
-				if msg.Envelope != nil && msg.Envelope.Type == "END_OF_STREAM" {
-					return
-				}
-			}
-		}
-	}()
-
-	return out
+	return &envelope, nil
 }
 
 type streamGetter func(ctx context.Context) (<-chan EnvelopeOrError, error)
@@ -154,50 +128,50 @@ func reconnectStream(ctx context.Context, stream streamGetter, delay time.Durati
 		defer close(out)
 
 		for {
-			stop := func() bool {
-				streamCtx, streamCancel := context.WithCancel(ctx)
-				defer streamCancel()
-
-				in, err := stream(streamCtx)
+			func() {
+				in, err := stream(ctx)
 
 				if err != nil {
 					select {
 					case out <- EnvelopeOrError{Err: fmt.Errorf("get stream: %v", err)}:
-						return false
+						return
 					case <-ctx.Done():
-						return true
+						return
 					}
 				}
 
+				var (
+					envelope      EnvelopeOrError
+					envelopeReady = false
+					open          = true
+				)
+
 				for {
+					if !open && !envelopeReady {
+						return
+					}
+
 					var (
-						msg EnvelopeOrError
-						ok  bool
+						inCh  <-chan EnvelopeOrError
+						outCh chan<- EnvelopeOrError
 					)
 
-					select {
-					case msg, ok = <-in:
-						// Message received
-					case <-ctx.Done():
-						return true
-					}
-
-					if !ok {
-						return false
+					if envelopeReady {
+						outCh = out
+					} else if open {
+						inCh = in
 					}
 
 					select {
-					case out <- msg:
-						// Message sent
+					case envelope, open = <-inCh:
+						envelopeReady = open
+					case outCh <- envelope:
+						envelopeReady = false
 					case <-ctx.Done():
-						return true
+						return
 					}
 				}
 			}()
-
-			if stop {
-				return
-			}
 
 			select {
 			case <-time.After(delay):

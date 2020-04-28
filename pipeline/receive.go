@@ -16,6 +16,7 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -108,21 +109,17 @@ type Envelope struct {
 // reconnects to the Adobe Pipeline.
 func (c *Client) Receive(ctx context.Context, topic string, r *ReceiveRequest) <-chan EnvelopeOrError {
 	stream := func(ctx context.Context) (<-chan EnvelopeOrError, error) {
-		ch, err := c.receive(ctx, topic, r)
+		body, err := c.receive(ctx, topic, r)
 		if err != nil {
 			return nil, err
 		}
-
-		ch = pingFilter(ctx, ch, r.pingTimeout())
-		ch = endOfStreamFilter(ctx, ch)
-
-		return ch, nil
+		return envelopeStream(ctx, body, r.pingTimeout()), nil
 	}
 
 	return reconnectStream(ctx, stream, r.reconnectionDelay())
 }
 
-func (c *Client) receive(ctx context.Context, topic string, r *ReceiveRequest) (<-chan EnvelopeOrError, error) {
+func (c *Client) receive(ctx context.Context, topic string, r *ReceiveRequest) (io.ReadCloser, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, receiveURL(c.pipelineURL, c.group, topic, r), nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %v", err)
@@ -143,11 +140,16 @@ func (c *Client) receive(ctx context.Context, topic string, r *ReceiveRequest) (
 	}
 
 	if res.StatusCode != http.StatusOK {
-		defer res.Body.Close()
-		return nil, newError(res)
+		err := newError(res)
+
+		if err := res.Body.Close(); err != nil {
+			return nil, fmt.Errorf("close response body: %v", err)
+		}
+
+		return nil, err
 	}
 
-	return envelopeStream(ctx, res.Body), nil
+	return res.Body, nil
 }
 
 func receiveURL(pipelineURL, group, topic string, r *ReceiveRequest) string {

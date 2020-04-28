@@ -16,226 +16,158 @@ package pipeline
 import (
 	"context"
 	"fmt"
-	"github.com/google/go-cmp/cmp"
-	"io/ioutil"
-	"log"
-	"strings"
+	"io"
 	"testing"
 	"time"
 )
 
 func TestEnvelopeStream(t *testing.T) {
-	body := ioutil.NopCloser(strings.NewReader(`
-		{
-			"envelopeType": "type-1",
-			"partition": 1,
-			"key": "key-1",
-			"offset": 2,
-			"topic": "topic-1",
-			"createTime": 3,
-			"pipelineMessage": {
-				"imsOrg": "org-1",
-				"key": "key-1",
-				"locations": ["loc-1", "loc-2"],
-				"source": "source-1",
-				"value": "value-1"
-			},
-			"syncMarker": "marker-1"
-		}
-		{
-			"envelopeType": "type-2",
-			"partition": 4,
-			"key": "key-2",
-			"offset": 5,
-			"topic": "topic-2",
-			"createTime": 6,
-			"pipelineMessage": {
-				"imsOrg": "org-2",
-				"key": "key-2",
-				"locations": ["loc-3", "loc-4"],
-				"source": "source-2",
-				"value": "value-2"
-			},
-			"syncMarker": "marker-2"
-		}
-	`))
+	r, w := io.Pipe()
 
-	ch := envelopeStream(context.Background(), body)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	envelopes := []Envelope{
-		{
-			Type:       "type-1",
-			Partition:  1,
-			Key:        "key-1",
-			Offset:     2,
-			Topic:      "topic-1",
-			CreateTime: 3,
-			Message: Message{
-				ImsOrg:    "org-1",
-				Key:       "key-1",
-				Locations: []string{"loc-1", "loc-2"},
-				Source:    "source-1",
-				Value:     []byte(`"value-1"`),
-			},
-			SyncMarker: "marker-1",
-		},
-		{
-			Type:       "type-2",
-			Partition:  4,
-			Key:        "key-2",
-			Offset:     5,
-			Topic:      "topic-2",
-			CreateTime: 6,
-			Message: Message{
-				ImsOrg:    "org-2",
-				Key:       "key-2",
-				Locations: []string{"loc-3", "loc-4"},
-				Source:    "source-2",
-				Value:     []byte(`"value-2"`),
-			},
-			SyncMarker: "marker-2",
-		},
+	out := envelopeStream(ctx, r, time.Millisecond)
+
+	// Write a data message.
+
+	fmt.Fprint(w, `{"envelopeType": "DATA"}`)
+
+	// Check that the message is received.
+
+	if msg, ok := <-out; !ok {
+		t.Fatalf("the channel should not be closed")
+	} else if msg.Err != nil {
+		t.Fatalf("unexpected error: %v", msg.Err)
+	} else if msg.Envelope.Type != "DATA" {
+		t.Fatalf("invalid envelope: %v", msg.Envelope.Type)
 	}
 
-	for _, e := range envelopes {
-		if msg, ok := <-ch; !ok {
-			log.Fatalf("the channel is closed")
-		} else if msg.Err != nil {
-			t.Fatalf("error: %v", msg.Err)
-		} else if !cmp.Equal(msg.Envelope, &e) {
-			t.Fatalf("invalid message\n%v", cmp.Diff(msg.Envelope, &e))
-		}
-	}
+	// Close the body.
 
-	if _, ok := <-ch; ok {
+	w.Close()
+
+	// Check that the channel is closed.
+
+	if _, ok := <-out; ok {
 		t.Fatalf("the channel should be closed")
 	}
 }
 
-func TestReceiveInvalidContent(t *testing.T) {
-	body := ioutil.NopCloser(strings.NewReader("invalid"))
+func TestEnvelopeStreamInvalidContent(t *testing.T) {
+	r, w := io.Pipe()
 
-	ch := envelopeStream(context.Background(), body)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	if msg, ok := <-ch; !ok {
-		log.Fatalf("the channel is closed")
+	out := envelopeStream(ctx, r, time.Millisecond)
+
+	// Write invalid content.
+
+	fmt.Fprint(w, `invalid`)
+
+	// Check that an error is returned.
+
+	if msg, ok := <-out; !ok {
+		t.Fatalf("the channel should not be closed")
 	} else if msg.Err == nil {
-		log.Fatalf("expected error")
-	} else if _, ok := <-ch; ok {
-		t.Fatalf("the channel should be closed")
+		t.Fatalf("expected error")
 	}
 
-	if _, ok := <-ch; ok {
-		t.Fatalf("the channel should be closed")
-	}
-}
-
-func messageSender(messages []EnvelopeOrError) <-chan EnvelopeOrError {
-	out := make(chan EnvelopeOrError)
-
-	go func() {
-		defer close(out)
-
-		for _, msg := range messages {
-			out <- msg
-		}
-	}()
-
-	return out
-}
-
-func TestPingFilter(t *testing.T) {
-	messages := []EnvelopeOrError{
-		{
-			Envelope: &Envelope{
-				Type: "PING",
-			},
-		},
-		{
-			Envelope: &Envelope{
-				Type: "DATA",
-			},
-		},
-		{
-			Envelope: &Envelope{
-				Type: "PING",
-			},
-		},
-	}
-
-	out := pingFilter(context.Background(), messageSender(messages), 1*time.Second)
-
-	for _, msg := range messages {
-		if got, ok := <-out; !ok {
-			t.Fatalf("the channel is closed")
-		} else if !cmp.Equal(msg, got) {
-			t.Fatalf("invalid message\n%v", cmp.Diff(msg, got))
-		}
-	}
+	// Check that the channel is closed.
 
 	if _, ok := <-out; ok {
 		t.Fatalf("the channel should be closed")
 	}
+
+	// Check that the body is closed.
+
+	if _, err := fmt.Fprint(w, "fail"); err != io.ErrClosedPipe {
+		t.Fatalf("the body should be closed: %v", err)
+	}
 }
 
-func TestPingFilterTimeout(t *testing.T) {
-	out := pingFilter(context.Background(), make(chan EnvelopeOrError), time.Millisecond)
+func TestEnvelopeStreamPingTimeout(t *testing.T) {
+	r, w := io.Pipe()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out := envelopeStream(ctx, r, time.Millisecond)
+
+	// Write a data message.
+
+	fmt.Fprint(w, `{"envelopeType": "DATA"}`)
+
+	// Check that the message is received.
+
+	if msg, ok := <-out; !ok {
+		t.Fatalf("the channel should not be closed")
+	} else if msg.Err != nil {
+		t.Fatalf("unexpected error: %v", msg.Err)
+	} else if msg.Envelope.Type != "DATA" {
+		t.Fatalf("invalid envelope: %v", msg.Envelope.Type)
+	}
+
+	// Write a ping message
+
+	fmt.Fprint(w, `{"envelopeType": "PING"}`)
+
+	// Check that the message is received.
+
+	if msg, ok := <-out; !ok {
+		t.Fatalf("the channel should not be closed")
+	} else if msg.Err != nil {
+		t.Fatalf("unexpected error: %v", msg.Err)
+	} else if msg.Envelope.Type != "PING" {
+		t.Fatalf("invalid envelope: %v", msg.Envelope.Type)
+	}
+
+	// Let the timeout expire and check that the channel is closed.
 
 	if _, ok := <-out; ok {
 		t.Fatalf("the channel should be closed")
 	}
+
+	// Check that the body is closed.
+
+	if _, err := fmt.Fprint(w, "fail"); err != io.ErrClosedPipe {
+		t.Fatalf("the body should have been closed")
+	}
 }
 
-func TestPingFilterTimeoutReset(t *testing.T) {
-	in := make(chan EnvelopeOrError)
+func TestEnvelopeStreamEndOfStream(t *testing.T) {
+	r, w := io.Pipe()
 
-	go func() {
-		defer close(in)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-		in <- EnvelopeOrError{
-			Envelope: &Envelope{
-				Type: "PING",
-			},
-		}
-	}()
+	out := envelopeStream(ctx, r, time.Millisecond)
 
-	out := pingFilter(context.Background(), in, time.Millisecond)
+	// Write an end of stream message.
 
-	if _, ok := <-out; !ok {
-		t.Fatalf("a message should be returned")
+	fmt.Fprint(w, `{"envelopeType": "END_OF_STREAM"}`)
+
+	// Check that the message is received.
+
+	if msg, ok := <-out; !ok {
+		t.Fatalf("the channel should not be closed")
+	} else if msg.Err != nil {
+		t.Fatalf("unexpected error: %v", msg.Err)
+	} else if msg.Envelope.Type != "END_OF_STREAM" {
+		t.Fatalf("invalid envelope: %v", msg.Envelope.Type)
 	}
+
+	// Let the timeout expire and check that the channel is closed.
 
 	if _, ok := <-out; ok {
 		t.Fatalf("the channel should be closed")
 	}
-}
 
-func TestEndOfStreamFilter(t *testing.T) {
-	messages := []EnvelopeOrError{
-		{
-			Envelope: &Envelope{
-				Type: "PING",
-			},
-		},
-		{
-			Envelope: &Envelope{
-				Type: "END_OF_STREAM",
-			},
-		},
-	}
+	// Check that the body is closed.
 
-	out := endOfStreamFilter(context.Background(), messageSender(messages))
-
-	for _, msg := range messages {
-		if got, ok := <-out; !ok {
-			t.Fatalf("the channel is closed")
-		} else if !cmp.Equal(msg, got) {
-			t.Fatalf("invalid message\n%v", cmp.Diff(msg, got))
-		}
-	}
-
-	if _, ok := <-out; ok {
-		t.Fatalf("the channel should be closed")
+	if _, err := fmt.Fprint(w, "fail"); err != io.ErrClosedPipe {
+		t.Fatalf("the body should have been closed")
 	}
 }
 
@@ -312,136 +244,5 @@ func TestReconnectStreamError(t *testing.T) {
 		} else if msg.Err.Error() != "get stream: nope" {
 			t.Fatalf("invalid error: %v", msg.Err)
 		}
-	}()
-}
-
-func TestReconnectStreamDelay(t *testing.T) {
-	var (
-		connections = make(chan time.Time, 2)
-		errs        = make(chan error)
-	)
-
-	stream := func(ctx context.Context) (<-chan EnvelopeOrError, error) {
-		now := time.Now()
-
-		select {
-		case connections <- now:
-			// Signal sent
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-
-		select {
-		case err := <-errs:
-			return nil, err
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	out := reconnectStream(ctx, stream, time.Millisecond)
-
-	func() {
-		errs <- fmt.Errorf("first error")
-
-		if msg, ok := <-out; !ok {
-			t.Fatalf("channel should be open")
-		} else if !strings.Contains(msg.Err.Error(), "first error") {
-			t.Fatalf("invalid error: %v", msg.Err)
-		}
-	}()
-
-	func() {
-		errs <- fmt.Errorf("second error")
-
-		if msg, ok := <-out; !ok {
-			t.Fatalf("channel should be open")
-		} else if !strings.Contains(msg.Err.Error(), "second error") {
-			t.Fatalf("invalid error: %v", msg.Err)
-		}
-	}()
-
-	first, second := <-connections, <-connections
-
-	if delay := second.Sub(first); delay < time.Millisecond {
-		t.Fatalf("invalid delay: %v", delay)
-	}
-}
-
-func TestReconnectStreamCancel(t *testing.T) {
-
-	// testCtx is needed only because we can't be sure that the stream will be
-	// recreated by the reconnectStream before we have a chance to shut it
-	// down. testCtx prevents this test from leaking (at most) a goroutine.
-
-	testCtx, testCancel := context.WithCancel(context.Background())
-	defer testCancel()
-
-	var (
-		errs          = make(chan error)
-		cancellations = make(chan struct{})
-	)
-
-	stream := func(ctx context.Context) (<-chan EnvelopeOrError, error) {
-		out := make(chan EnvelopeOrError)
-
-		go func() {
-			var err error
-
-			// Get the error or return early if the test is over. Note that we
-			// only need to check testCtx once, at this point. If the read from
-			// errs goes through, the test will make sure that the rest of the
-			// operations will not block.
-
-			select {
-			case err = <-errs:
-				// Error received, go ahead.
-			case <-testCtx.Done():
-				close(out)
-				return
-			}
-
-			// Send the error down the stream and close the channel. This will
-			// force the reconnectStream to instantiate a new connection.
-
-			out <- EnvelopeOrError{Err: err}
-			close(out)
-
-			// Since this stream terminated and a new one is being created, this
-			// stream should receive a cancellation signal through the channel.
-
-			<-ctx.Done()
-
-			// Communicate to the test that this stream has been cancelled. The
-			// test is going to be waiting for it, so this write will not block
-			// indefinitely.
-
-			cancellations <- struct{}{}
-		}()
-
-		return out, nil
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	out := reconnectStream(ctx, stream, 0)
-
-	func() {
-		errs <- fmt.Errorf("nope")
-
-		if msg, ok := <-out; !ok {
-			t.Fatalf("channel should be open")
-		} else if msg.Err.Error() != "nope" {
-			t.Fatalf("invalid error: %v", msg.Err)
-		}
-
-		// If the reconnectStream doesn't cancel the current stream, the
-		// following read will block indefinitely.
-
-		<-cancellations
 	}()
 }
