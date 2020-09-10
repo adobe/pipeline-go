@@ -29,6 +29,12 @@ type ReceiveRequest struct {
 	// specified, SYNC envelopes are not sent. If specified, it has to be
 	// greater than or equal to 5s.
 	SyncInterval time.Duration
+	// The SYNC envelopes can also be sent every "N" messages. If only the
+	// SyncMessages parameter is present and if at any point the number of
+	// messages consumed is less than the number specified and there are no
+	// new messages to be consumed from the topic for 5 seconds, a SYNC
+	// envelope will be sent after 5 seconds.
+	SyncMessages int
 	// If specified, send only messages for these IMS organizations.
 	Organizations []string
 	// If specified, send only messages from these sources.
@@ -161,6 +167,10 @@ func receiveURL(pipelineURL, group, topic string, r *ReceiveRequest) string {
 
 	if r.SyncInterval != 0 {
 		values.Set("syncInterval", fmt.Sprintf("%d", r.SyncInterval.Milliseconds()))
+	}
+
+	if r.SyncMessages != 0 {
+		values.Set("syncMessages", fmt.Sprintf("%d", r.SyncMessages))
 	}
 
 	if r.Organizations != nil {

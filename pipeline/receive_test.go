@@ -57,6 +57,19 @@ func TestReceiveURLWithSyncInterval(t *testing.T) {
 	}
 }
 
+func TestReceiveURLWithSyncMessages(t *testing.T) {
+	u, err := url.Parse(receiveURL("https://www.acme.com", "g", "t", &ReceiveRequest{
+		SyncMessages: 10,
+	}))
+	if err != nil {
+		t.Fatalf("parse URL: %v", err)
+	}
+
+	if v := u.Query().Get("syncMessages"); v != "10" {
+		t.Fatalf("invalid sync messages: %v", v)
+	}
+}
+
 func TestReceiveURLWithOrganizations(t *testing.T) {
 	u, err := url.Parse(receiveURL("https://www.acme.com", "g", "t", &ReceiveRequest{
 		Organizations: []string{"o1", "o2"},
@@ -66,7 +79,7 @@ func TestReceiveURLWithOrganizations(t *testing.T) {
 	}
 
 	if v := u.Query().Get("org"); v != "o1,o2" {
-		t.Fatalf("invalid sync interval: %v", v)
+		t.Fatalf("invalid organizations: %v", v)
 	}
 }
 
