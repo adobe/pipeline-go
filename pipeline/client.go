@@ -16,6 +16,7 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"github.com/hashicorp/go-retryablehttp"
 	"net/http"
 	"net/url"
 )
@@ -69,7 +70,7 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 	client := cfg.Client
 
 	if client == nil {
-		client = http.DefaultClient
+		client = defaultRetryClient().HTTPClient
 	}
 
 	return &Client{
@@ -78,6 +79,17 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 		group:       cfg.Group,
 		tokenGetter: cfg.TokenGetter,
 	}, nil
+}
+
+// Adobe pipeline makes use of status code 429 in combination of the retry-after header
+// the default http client does not retry in these requests, hence using a retriable as default instead
+func defaultRetryClient() *retryablehttp.Client {
+	rc := retryablehttp.NewClient()
+	rc.RetryMax = 10
+	rc.Logger = nil
+	// use the Passthrough handler to propagate the payload from the last error to the caller in a transparent manner
+	rc.ErrorHandler = retryablehttp.PassthroughErrorHandler
+	return rc
 }
 
 func urlMustParse(u string) *url.URL {
