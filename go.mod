@@ -18,4 +18,5 @@ go 1.14
 require (
 	github.com/adobe/ims-go v0.4.0
 	github.com/google/go-cmp v0.4.0
+	github.com/hashicorp/go-retryablehttp v0.7.4
 )

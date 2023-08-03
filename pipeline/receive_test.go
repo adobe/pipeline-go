@@ -189,7 +189,12 @@ func TestReceiveError(t *testing.T) {
 	}))
 	defer s.Close()
 
+	retryClient := defaultRetryClient()
+	retryClient.RetryWaitMax = 5 * time.Millisecond
+	retryClient.RetryMax = 2
+
 	c, err := NewClient(&ClientConfig{
+		Client:      retryClient.StandardClient(),
 		PipelineURL: s.URL,
 		Group:       "g",
 		TokenGetter: stringTokenGetter("token"),
