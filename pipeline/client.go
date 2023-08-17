@@ -70,7 +70,7 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 	client := cfg.Client
 
 	if client == nil {
-		client = defaultRetryClient().HTTPClient
+		client = defaultRetryClient().StandardClient()
 	}
 
 	return &Client{
